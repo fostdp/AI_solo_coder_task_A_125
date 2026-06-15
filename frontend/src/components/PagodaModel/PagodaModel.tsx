@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
+import { LOD } from 'three'
 import type { DamageResult } from '@/types'
 import './PagodaModel.scss'
 
@@ -12,7 +13,13 @@ interface PagodaModelProps {
   damageResults?: DamageResult[]
   selectedFloor?: number
   onFloorSelect?: (floor: number) => void
+  enableLOD?: boolean
+  enableOcclusionCulling?: boolean
+  lodDistances?: { high: number; medium: number; low: number }
+  height?: number
 }
+
+type DetailLevel = 'high' | 'medium' | 'low'
 
 const FLOOR_HEIGHTS = [0, 6.59, 5.49, 4.99, 4.59, 4.09]
 const FLOOR_DIAMETERS = [0, 30.27, 22.65, 18.46, 15.28, 12.10]
@@ -30,6 +37,18 @@ const WOOD_COLORS = {
   damage: 0xFF0000
 }
 
+const LOD_DISTANCES = {
+  high: 30,
+  medium: 60,
+  low: 100
+}
+
+const GEOMETRY_DETAIL = {
+  high: { segments: 8, bracketSegments: 3 },
+  medium: { segments: 6, bracketSegments: 2 },
+  low: { segments: 4, bracketSegments: 1 }
+}
+
 export default function PagodaModel({
   showSensors = true,
   showDamage = true,
@@ -37,7 +56,11 @@ export default function PagodaModel({
   vibrationAmplitude = 0,
   damageResults = [],
   selectedFloor,
-  onFloorSelect
+  onFloorSelect,
+  enableLOD = true,
+  enableOcclusionCulling = true,
+  lodDistances = LOD_DISTANCES,
+  height
 }: PagodaModelProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const sceneRef = useRef<THREE.Scene | null>(null)
@@ -46,14 +69,27 @@ export default function PagodaModel({
   const controlsRef = useRef<OrbitControls | null>(null)
   const animationIdRef = useRef<number>(0)
   const floorGroupsRef = useRef<THREE.Group[]>([])
+  const floorLODsRef = useRef<LOD[]>([])
   const sensorMarkersRef = useRef<THREE.Mesh[]>([])
   const damageMarkersRef = useRef<THREE.Mesh[]>([])
   const timeRef = useRef(0)
+  const frustumRef = useRef<THREE.Frustum>(new THREE.Frustum())
+  const projScreenMatrixRef = useRef<THREE.Matrix4>(new THREE.Matrix4())
 
   const [isLoaded, setIsLoaded] = useState(false)
+  const [performanceInfo, setPerformanceInfo] = useState<{
+    triangles: number
+    drawCalls: number
+    fps: number
+    lodLevel: DetailLevel
+  }>({ triangles: 0, drawCalls: 0, fps: 60, lodLevel: 'high' })
+  const frameCountRef = useRef(0)
+  const lastTimeRef = useRef(performance.now())
+  const currentLODRef = useRef<DetailLevel>('high')
 
-  const createColumn = useCallback((height: number, position: THREE.Vector3) => {
-    const geometry = new THREE.CylinderGeometry(0.25, 0.3, height, 8)
+  const createColumn = useCallback((height: number, position: THREE.Vector3, detailLevel: DetailLevel = 'high') => {
+    const detail = GEOMETRY_DETAIL[detailLevel]
+    const geometry = new THREE.CylinderGeometry(0.25, 0.3, height, detail.segments)
     const material = new THREE.MeshPhongMaterial({
       color: WOOD_COLORS.column,
       shininess: 30
@@ -61,13 +97,18 @@ export default function PagodaModel({
     const column = new THREE.Mesh(geometry, material)
     column.position.copy(position)
     column.position.y += height / 2
-    column.castShadow = true
+    column.castShadow = detailLevel !== 'low'
     column.receiveShadow = true
+    column.frustumCulled = enableOcclusionCulling
+    column.userData.detailLevel = detailLevel
     return column
-  }, [])
+  }, [enableOcclusionCulling])
 
-  const createBeam = useCallback((length: number, position: THREE.Vector3, rotation: number) => {
-    const geometry = new THREE.BoxGeometry(0.3, 0.4, length)
+  const createBeam = useCallback((length: number, position: THREE.Vector3, rotation: number, detailLevel: DetailLevel = 'high') => {
+    const detail = GEOMETRY_DETAIL[detailLevel]
+    const width = detailLevel === 'low' ? 0.4 : 0.3
+    const height = detailLevel === 'low' ? 0.5 : 0.4
+    const geometry = new THREE.BoxGeometry(width, height, length, detail.segments, detail.segments, detail.segments)
     const material = new THREE.MeshPhongMaterial({
       color: WOOD_COLORS.beam,
       shininess: 30
@@ -75,41 +116,85 @@ export default function PagodaModel({
     const beam = new THREE.Mesh(geometry, material)
     beam.position.copy(position)
     beam.rotation.y = rotation
-    beam.castShadow = true
+    beam.castShadow = detailLevel !== 'low'
     beam.receiveShadow = true
+    beam.frustumCulled = enableOcclusionCulling
+    beam.userData.detailLevel = detailLevel
     return beam
-  }, [])
+  }, [enableOcclusionCulling])
 
-  const createBracketSet = useCallback((position: THREE.Vector3, scale: number = 1) => {
+  const createBracketSet = useCallback((position: THREE.Vector3, scale: number = 1, detailLevel: DetailLevel = 'high') => {
     const group = new THREE.Group()
     
+    if (detailLevel === 'low') {
+      const simpleBracket = new THREE.Mesh(
+        new THREE.BoxGeometry(0.8 * scale, 0.4 * scale, 0.4 * scale),
+        new THREE.MeshPhongMaterial({ color: WOOD_COLORS.bracket, shininess: 30 })
+      )
+      simpleBracket.position.copy(position)
+      simpleBracket.frustumCulled = enableOcclusionCulling
+      simpleBracket.userData.detailLevel = detailLevel
+      group.add(simpleBracket)
+      return group
+    }
+    
+    const detail = GEOMETRY_DETAIL[detailLevel]
     const bracketGeo = new THREE.BoxGeometry(0.8 * scale, 0.3 * scale, 0.4 * scale)
     const bracketMat = new THREE.MeshPhongMaterial({
       color: WOOD_COLORS.bracket,
       shininess: 50
     })
     
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < detail.bracketSegments; i++) {
       const bracket = new THREE.Mesh(bracketGeo, bracketMat)
       bracket.position.set(
         i * 0.3 * scale,
         i * 0.15 * scale,
         0
       )
-      bracket.castShadow = true
+      bracket.castShadow = detailLevel === 'high'
+      bracket.frustumCulled = enableOcclusionCulling
+      bracket.userData.detailLevel = detailLevel
       group.add(bracket)
     }
     
     group.position.copy(position)
     return group
-  }, [])
+  }, [enableOcclusionCulling])
 
-  const createRoof = useCallback((diameter: number, floor: number) => {
+  const createRoof = useCallback((diameter: number, floor: number, detailLevel: DetailLevel = 'high') => {
     const group = new THREE.Group()
     
     const roofHeight = diameter * 0.25
+    const detail = GEOMETRY_DETAIL[detailLevel]
+    const latheSegments = detailLevel === 'low' ? 16 : detailLevel === 'medium' ? 24 : 32
+    const eaveCount = detailLevel === 'low' ? 4 : BEAM_COUNT
+    
+    if (detailLevel === 'low') {
+      const simpleRoofGeo = new THREE.ConeGeometry(diameter / 2, roofHeight, latheSegments)
+      const roofMat = new THREE.MeshPhongMaterial({
+        color: WOOD_COLORS.roof,
+        shininess: 50
+      })
+      const roof = new THREE.Mesh(simpleRoofGeo, roofMat)
+      roof.position.y = roofHeight / 2
+      roof.frustumCulled = enableOcclusionCulling
+      roof.userData.detailLevel = detailLevel
+      group.add(roof)
+      
+      if (floor === 5) {
+        const spireGeo = new THREE.ConeGeometry(0.5, 3, 6)
+        const spireMat = new THREE.MeshPhongMaterial({ color: 0xFFD700, shininess: 80 })
+        const spire = new THREE.Mesh(spireGeo, spireMat)
+        spire.position.y = roofHeight + 1.5
+        spire.frustumCulled = enableOcclusionCulling
+        group.add(spire)
+      }
+      return group
+    }
+    
     const points: THREE.Vector2[] = []
-    const segments = 20
+    const segments = detailLevel === 'medium' ? 15 : 20
     for (let i = 0; i <= segments; i++) {
       const t = i / segments
       const r = diameter / 2 * (1 - t * 0.3)
@@ -117,7 +202,7 @@ export default function PagodaModel({
       points.push(new THREE.Vector2(r, y))
     }
     
-    const roofGeo = new THREE.LatheGeometry(points, 32)
+    const roofGeo = new THREE.LatheGeometry(points, latheSegments)
     const roofMat = new THREE.MeshPhongMaterial({
       color: WOOD_COLORS.roof,
       shininess: 80,
@@ -126,11 +211,13 @@ export default function PagodaModel({
     const roof = new THREE.Mesh(roofGeo, roofMat)
     roof.castShadow = true
     roof.receiveShadow = true
+    roof.frustumCulled = enableOcclusionCulling
+    roof.userData.detailLevel = detailLevel
     group.add(roof)
     
     const eaveLength = diameter * 0.15
-    for (let i = 0; i < BEAM_COUNT; i++) {
-      const angle = (i / BEAM_COUNT) * Math.PI * 2
+    for (let i = 0; i < eaveCount; i++) {
+      const angle = (i / eaveCount) * Math.PI * 2
       const eaveGeo = new THREE.BoxGeometry(0.15, 0.08, eaveLength)
       const eaveMat = new THREE.MeshPhongMaterial({
         color: 0x4A2511,
@@ -144,12 +231,14 @@ export default function PagodaModel({
       )
       eave.rotation.y = angle + Math.PI / 2
       eave.rotation.z = 0.15
-      eave.castShadow = true
+      eave.castShadow = detailLevel === 'high'
+      eave.frustumCulled = enableOcclusionCulling
+      eave.userData.detailLevel = detailLevel
       group.add(eave)
     }
     
     if (floor === 5) {
-      const spireGeo = new THREE.ConeGeometry(0.5, 3, 8)
+      const spireGeo = new THREE.ConeGeometry(0.5, 3, detail.segments)
       const spireMat = new THREE.MeshPhongMaterial({
         color: 0xFFD700,
         shininess: 100
@@ -157,23 +246,26 @@ export default function PagodaModel({
       const spire = new THREE.Mesh(spireGeo, spireMat)
       spire.position.y = roofHeight + 1.5
       spire.castShadow = true
+      spire.frustumCulled = enableOcclusionCulling
       group.add(spire)
     }
     
     return group
-  }, [])
+  }, [enableOcclusionCulling])
 
-  const createFloor = useCallback((floor: number) => {
+  const createFloor = useCallback((floor: number, detailLevel: DetailLevel = 'high') => {
     const group = new THREE.Group()
     group.name = `floor_${floor}`
     group.userData.floorNumber = floor
+    group.userData.detailLevel = detailLevel
     
     const baseY = FLOOR_HEIGHTS.slice(0, floor + 1).reduce((a, b) => a + b, 0) - FLOOR_HEIGHTS[floor]
     const height = FLOOR_HEIGHTS[floor]
     const diameter = FLOOR_DIAMETERS[floor]
     const radius = diameter / 2
     
-    const platformGeo = new THREE.CylinderGeometry(radius + 0.5, radius + 0.8, 0.4, 32)
+    const platformSegments = detailLevel === 'low' ? 16 : 32
+    const platformGeo = new THREE.CylinderGeometry(radius + 0.5, radius + 0.8, 0.4, platformSegments)
     const platformMat = new THREE.MeshPhongMaterial({
       color: 0x5D4037,
       shininess: 20
@@ -181,67 +273,159 @@ export default function PagodaModel({
     const platform = new THREE.Mesh(platformGeo, platformMat)
     platform.position.y = baseY
     platform.receiveShadow = true
+    platform.frustumCulled = enableOcclusionCulling
+    platform.userData.detailLevel = detailLevel
     group.add(platform)
     
-    for (let i = 0; i < COLUMN_COUNT; i++) {
-      const angle = (i / COLUMN_COUNT) * Math.PI * 2
+    const colCount = detailLevel === 'low' ? 8 : detailLevel === 'medium' ? 16 : COLUMN_COUNT
+    for (let i = 0; i < colCount; i++) {
+      const angle = (i / colCount) * Math.PI * 2
       const colRadius = radius * 0.85
       const position = new THREE.Vector3(
         Math.cos(angle) * colRadius,
         baseY + 0.2,
         Math.sin(angle) * colRadius
       )
-      const column = createColumn(height - 1, position)
+      const column = createColumn(height - 1, position, detailLevel)
       group.add(column)
     }
     
-    for (let i = 0; i < BEAM_COUNT; i++) {
-      const angle = (i / BEAM_COUNT) * Math.PI * 2
+    const beamCount = detailLevel === 'low' ? 4 : detailLevel === 'medium' ? 6 : BEAM_COUNT
+    for (let i = 0; i < beamCount; i++) {
+      const angle = (i / beamCount) * Math.PI * 2
       const beamLength = diameter * 0.9
       const position = new THREE.Vector3(
         Math.cos(angle) * radius * 0.3,
         baseY + height * 0.5,
         Math.sin(angle) * radius * 0.3
       )
-      const beam = createBeam(beamLength, position, angle)
+      const beam = createBeam(beamLength, position, angle, detailLevel)
       group.add(beam)
     }
     
-    for (let i = 0; i < COLUMN_COUNT; i++) {
-      const angle = (i / COLUMN_COUNT) * Math.PI * 2
-      const colRadius = radius * 0.85
-      const bracketPos = new THREE.Vector3(
-        Math.cos(angle) * colRadius,
-        baseY + height * 0.8,
-        Math.sin(angle) * colRadius
-      )
-      const bracket = createBracketSet(bracketPos, 0.6 + floor * 0.05)
-      bracket.rotation.y = angle + Math.PI / 2
-      group.add(bracket)
+    if (detailLevel !== 'low') {
+      const bracketCount = detailLevel === 'medium' ? 12 : COLUMN_COUNT
+      for (let i = 0; i < bracketCount; i++) {
+        const angle = (i / bracketCount) * Math.PI * 2
+        const colRadius = radius * 0.85
+        const bracketPos = new THREE.Vector3(
+          Math.cos(angle) * colRadius,
+          baseY + height * 0.8,
+          Math.sin(angle) * colRadius
+        )
+        const bracket = createBracketSet(bracketPos, 0.6 + floor * 0.05, detailLevel)
+        bracket.rotation.y = angle + Math.PI / 2
+        group.add(bracket)
+      }
     }
     
-    const roof = createRoof(diameter, floor)
+    const roof = createRoof(diameter, floor, detailLevel)
     roof.position.y = baseY + height * 0.9
     group.add(roof)
     
-    const railingHeight = 1.2
-    const postCount = 32
-    for (let i = 0; i < postCount; i++) {
-      const angle = (i / postCount) * Math.PI * 2
-      const postGeo = new THREE.CylinderGeometry(0.05, 0.05, railingHeight, 6)
-      const postMat = new THREE.MeshPhongMaterial({ color: 0x3E2723 })
-      const post = new THREE.Mesh(postGeo, postMat)
-      post.position.set(
-        Math.cos(angle) * (radius + 0.3),
-        baseY + 0.4 + railingHeight / 2,
-        Math.sin(angle) * (radius + 0.3)
-      )
-      post.castShadow = true
-      group.add(post)
+    if (detailLevel !== 'low') {
+      const railingHeight = 1.2
+      const postCount = detailLevel === 'medium' ? 16 : 32
+      for (let i = 0; i < postCount; i++) {
+        const angle = (i / postCount) * Math.PI * 2
+        const postGeo = new THREE.CylinderGeometry(0.05, 0.05, railingHeight, 6)
+        const postMat = new THREE.MeshPhongMaterial({ color: 0x3E2723 })
+        const post = new THREE.Mesh(postGeo, postMat)
+        post.position.set(
+          Math.cos(angle) * (radius + 0.3),
+          baseY + 0.4 + railingHeight / 2,
+          Math.sin(angle) * (radius + 0.3)
+        )
+        post.castShadow = detailLevel === 'high'
+        post.frustumCulled = enableOcclusionCulling
+        group.add(post)
+      }
     }
     
+    group.traverse((child) => {
+      if (child instanceof THREE.Mesh) {
+        child.userData.floorNumber = floor
+        child.userData.detailLevel = detailLevel
+      }
+    })
+    
     return group
-  }, [createColumn, createBeam, createBracketSet, createRoof])
+  }, [createColumn, createBeam, createBracketSet, createRoof, enableOcclusionCulling])
+
+  const createFloorLOD = useCallback((floor: number) => {
+    const lod = new LOD()
+    
+    const highDetail = createFloor(floor, 'high')
+    const mediumDetail = createFloor(floor, 'medium')
+    const lowDetail = createFloor(floor, 'low')
+    
+    lod.addLevel(highDetail, lodDistances.high)
+    lod.addLevel(mediumDetail, lodDistances.medium)
+    lod.addLevel(lowDetail, lodDistances.low)
+    
+    lod.userData.floorNumber = floor
+    lod.userData.basePosition = highDetail.position.clone()
+    
+    return lod
+  }, [createFloor, lodDistances])
+
+  const updateOcclusionCulling = useCallback(() => {
+    if (!enableOcclusionCulling || !cameraRef.current || !sceneRef.current) return
+    
+    const camera = cameraRef.current
+    sceneRef.current.updateMatrixWorld()
+    
+    projScreenMatrixRef.current.multiplyMatrices(
+      camera.projectionMatrix,
+      camera.matrixWorldInverse
+    )
+    frustumRef.current.setFromProjectionMatrix(projScreenMatrixRef.current)
+    
+    floorLODsRef.current.forEach((lod) => {
+      lod.visible = true
+      
+      const boundingSphere = lod.getObjectByProperty('userData', { detailLevel: 'high' })?.geometry?.boundingSphere
+      if (boundingSphere) {
+        const center = boundingSphere.center.clone()
+        lod.localToWorld(center)
+        lod.visible = frustumRef.current.intersectsSphere(
+          new THREE.Sphere(center, boundingSphere.radius * 1.2)
+        )
+      }
+    })
+  }, [enableOcclusionCulling])
+
+  const getCurrentLODLevel = useCallback((cameraPosition: THREE.Vector3, targetPosition: THREE.Vector3): DetailLevel => {
+    const distance = cameraPosition.distanceTo(targetPosition)
+    if (distance < lodDistances.high) return 'high'
+    if (distance < lodDistances.medium) return 'medium'
+    return 'low'
+  }, [lodDistances])
+
+  const computePerformanceMetrics = useCallback(() => {
+    if (!rendererRef.current || !sceneRef.current) return
+    
+    const info = rendererRef.current.info
+    const triangles = info.render.triangles
+    const drawCalls = info.render.calls
+    
+    frameCountRef.current++
+    const now = performance.now()
+    if (now - lastTimeRef.current >= 1000) {
+      const fps = Math.round((frameCountRef.current * 1000) / (now - lastTimeRef.current))
+      
+      const center = new THREE.Vector3(0, TOTAL_HEIGHT / 2, 0)
+      const lodLevel = cameraRef.current 
+        ? getCurrentLODLevel(cameraRef.current.position, center)
+        : 'high'
+      
+      currentLODRef.current = lodLevel
+      setPerformanceInfo({ triangles, drawCalls, fps, lodLevel })
+      
+      frameCountRef.current = 0
+      lastTimeRef.current = now
+    }
+  }, [getCurrentLODLevel])
 
   const createBase = useCallback(() => {
     const group = new THREE.Group()
@@ -391,7 +575,9 @@ export default function PagodaModel({
   }, [showDamage, damageResults, createDamageMarker])
 
   const updateVibration = useCallback((time: number) => {
-    floorGroupsRef.current.forEach((group, index) => {
+    const targetObjects = enableLOD ? floorLODsRef.current : floorGroupsRef.current
+    
+    targetObjects.forEach((group, index) => {
       const floor = index + 1
       const basePosition = group.userData.basePosition?.clone() || new THREE.Vector3()
       
@@ -438,7 +624,15 @@ export default function PagodaModel({
         mat.opacity = 0.3 + Math.sin(time * 5 + i) * 0.2
       }
     })
-  }, [vibrationMode, vibrationAmplitude])
+    
+    if (enableLOD) {
+      floorLODsRef.current.forEach(lod => {
+        if (cameraRef.current) {
+          lod.update(cameraRef.current)
+        }
+      })
+    }
+  }, [vibrationMode, vibrationAmplitude, enableLOD])
 
   const initScene = useCallback(() => {
     if (!containerRef.current) return
@@ -502,12 +696,22 @@ export default function PagodaModel({
     const base = createBase()
     scene.add(base)
     
-    floorGroupsRef.current = []
-    for (let floor = 1; floor <= 5; floor++) {
-      const floorGroup = createFloor(floor)
-      floorGroup.userData.basePosition = floorGroup.position.clone()
-      scene.add(floorGroup)
-      floorGroupsRef.current.push(floorGroup)
+    if (enableLOD) {
+      floorLODsRef.current = []
+      for (let floor = 1; floor <= 5; floor++) {
+        const floorLOD = createFloorLOD(floor)
+        floorLOD.userData.basePosition = new THREE.Vector3()
+        scene.add(floorLOD)
+        floorLODsRef.current.push(floorLOD)
+      }
+    } else {
+      floorGroupsRef.current = []
+      for (let floor = 1; floor <= 5; floor++) {
+        const floorGroup = createFloor(floor, 'high')
+        floorGroup.userData.basePosition = floorGroup.position.clone()
+        scene.add(floorGroup)
+        floorGroupsRef.current.push(floorGroup)
+      }
     }
     
     const groundGeo = new THREE.PlaneGeometry(200, 200)
@@ -561,6 +765,11 @@ export default function PagodaModel({
       timeRef.current += 0.016
       updateVibration(timeRef.current)
       
+      if (enableOcclusionCulling) {
+        updateOcclusionCulling()
+      }
+      computePerformanceMetrics()
+      
       controls.update()
       renderer.render(scene, camera)
     }
@@ -585,7 +794,7 @@ export default function PagodaModel({
         container.removeChild(renderer.domElement)
       }
     }
-  }, [createBase, createFloor, updateSensors, updateDamageMarkers, updateVibration, onFloorSelect])
+  }, [createBase, createFloor, updateSensors, updateDamageMarkers, updateVibration, onFloorSelect, updateOcclusionCulling, computePerformanceMetrics, enableOcclusionCulling])
 
   useEffect(() => {
     const cleanup = initScene()
@@ -652,6 +861,31 @@ export default function PagodaModel({
           <span className="value">{COLUMN_COUNT * 5}根</span>
         </div>
       </div>
+      {performanceInfo && (
+        <div className="performance-panel">
+          <div className="perf-title">性能监控</div>
+          <div className="perf-item">
+            <span className="perf-label">FPS:</span>
+            <span className={`perf-value ${performanceInfo.fps >= 50 ? 'good' : performanceInfo.fps >= 30 ? 'warn' : 'bad'}`}>
+              {performanceInfo.fps}
+            </span>
+          </div>
+          <div className="perf-item">
+            <span className="perf-label">三角形:</span>
+            <span className="perf-value">{performanceInfo.triangles.toLocaleString()}</span>
+          </div>
+          <div className="perf-item">
+            <span className="perf-label">绘制调用:</span>
+            <span className="perf-value">{performanceInfo.drawCalls}</span>
+          </div>
+          <div className="perf-item">
+            <span className="perf-label">LOD级别:</span>
+            <span className={`perf-value lod-${performanceInfo.lodLevel}`}>
+              {performanceInfo.lodLevel === 'high' ? '高细节' : performanceInfo.lodLevel === 'medium' ? '中细节' : '低细节'}
+            </span>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
