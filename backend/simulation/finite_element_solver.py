@@ -3,7 +3,161 @@ from scipy.linalg import eigh, cholesky, solve
 from scipy.sparse import lil_matrix, csr_matrix
 from scipy.sparse.linalg import spsolve
 from typing import Dict, List, Tuple, Optional, Callable
+from dataclasses import dataclass
 from .timber_constitutive import TimberOrthotropicConstitutive, TimberBeamElement
+
+
+@dataclass
+class NonlinearSpringProperties:
+    """非线性弹簧单元参数 - 模拟榫卯节点"""
+    k_initial: float = 1e8           # 初始刚度 (N/m)
+    k_softening: float = 1e7         # 软化段刚度 (N/m)
+    yield_force: float = 1e5         # 屈服力 (N)
+    hardening_factor: float = 0.1    # 硬化系数
+    gap: float = 0.001               # 初始间隙 (m)
+    damping_ratio: float = 0.05      # 阻尼比
+
+
+class NonlinearRotationalSpring:
+    """
+    非线性转动弹簧单元 - 模拟榫卯节点的半刚性连接
+    采用三折线模型：弹性段 -> 屈服段 -> 软化段
+    """
+
+    def __init__(self, node_i: int, node_j: int,
+                 properties: NonlinearSpringProperties,
+                 axis: str = 'x'):
+        """
+        Args:
+            node_i, node_j: 连接的两个节点
+            properties: 弹簧参数
+            axis: 弹簧作用轴 'x', 'y', 'z'
+        """
+        self.node_i = node_i
+        self.node_j = node_j
+        self.properties = properties
+        self.axis = axis
+
+        self.history_deformation = 0.0
+        self.history_force = 0.0
+        self.unloading_stiffness = properties.k_initial
+        self.yielded = False
+        self.damage_index = 0.0
+
+    def compute_tangent_stiffness(self, deformation: float) -> float:
+        """
+        计算切线刚度（考虑非线性）
+
+        三折线本构模型:
+        F
+        ^
+        |       k2
+        |     /----
+        |    /
+        |   / k1
+        |  /
+        | /
+        +--------> δ
+              δ_y
+
+        Args:
+            deformation: 当前变形量 (rad)
+
+        Returns:
+            k_t: 切线刚度
+        """
+        d_abs = abs(deformation)
+        sign = np.sign(deformation)
+
+        if d_abs < self.properties.gap:
+            return 0.0
+
+        d_eff = d_abs - self.properties.gap
+        d_y = self.properties.yield_force / self.properties.k_initial
+
+        if d_eff <= d_y:
+            return self.properties.k_initial
+        elif d_eff <= 3 * d_y:
+            return self.properties.k_softening
+        else:
+            return self.properties.k_softening * self.properties.hardening_factor
+
+    def compute_force(self, deformation: float, velocity: float = 0.0) -> Tuple[float, float]:
+        """
+        计算弹簧力（考虑阻尼和加载历史）
+
+        Args:
+            deformation: 当前变形
+            velocity: 变形速度
+
+        Returns:
+            force: 弹簧力
+            stiffness: 割线刚度
+        """
+        d_abs = abs(deformation)
+        sign = np.sign(deformation) if deformation != 0 else 1.0
+
+        if d_abs < self.properties.gap:
+            return 0.0, 0.0
+
+        d_eff = d_abs - self.properties.gap
+        d_y = self.properties.yield_force / self.properties.k_initial
+
+        if d_eff <= d_y:
+            force_mag = self.properties.k_initial * d_eff
+            stiffness = self.properties.k_initial
+        elif d_eff <= 3 * d_y:
+            force_mag = self.properties.yield_force + \
+                       self.properties.k_softening * (d_eff - d_y)
+            stiffness = self.properties.k_softening
+            if not self.yielded:
+                self.yielded = True
+                self.unloading_stiffness = \
+                    (force_mag - self.history_force) / (d_eff - self.history_deformation + 1e-10)
+        else:
+            force_mag = self.properties.yield_force + \
+                       self.properties.k_softening * 2 * d_y + \
+                       self.properties.k_softening * self.properties.hardening_factor * (d_eff - 3 * d_y)
+            stiffness = self.properties.k_softening * self.properties.hardening_factor
+
+        damping_force = self.properties.damping_ratio * \
+                        2 * np.sqrt(self.properties.k_initial * 1.0) * velocity
+
+        total_force = sign * force_mag + damping_force
+
+        self.history_deformation = d_eff
+        self.history_force = force_mag
+
+        if d_eff > 3 * d_y:
+            self.damage_index = min(1.0, (d_eff - 3 * d_y) / (3 * d_y) * 0.5)
+
+        return total_force, stiffness
+
+    def get_element_stiffness_matrix(self, deformation: float = 0.0) -> np.ndarray:
+        """
+        获取单元刚度矩阵（12x12，对应两个节点的6个自由度）
+
+        转动弹簧仅在指定轴上产生刚度
+        """
+        k = self.compute_tangent_stiffness(deformation)
+        k_e = np.zeros((12, 12))
+
+        rot_idx = {'x': 3, 'y': 4, 'z': 5}[self.axis]
+
+        k_e[rot_idx, rot_idx] = k
+        k_e[rot_idx, rot_idx + 6] = -k
+        k_e[rot_idx + 6, rot_idx] = -k
+        k_e[rot_idx + 6, rot_idx + 6] = k
+
+        return k_e
+
+    def reset(self):
+        """重置弹簧状态"""
+        self.history_deformation = 0.0
+        self.history_force = 0.0
+        self.unloading_stiffness = self.properties.k_initial
+        self.yielded = False
+        self.damage_index = 0.0
 
 
 class PagodaFEAModel:
@@ -12,16 +166,21 @@ class PagodaFEAModel:
     简化的多层框架模型，考虑木材各向异性
     """
 
-    def __init__(self, timber_properties: Dict[str, float]):
+    def __init__(self, timber_properties: Dict[str, float],
+                 use_mortise_tenon: bool = True,
+                 spring_properties: Optional[NonlinearSpringProperties] = None):
         """
         初始化有限元模型
 
         Args:
             timber_properties: 木材材料参数
+            use_mortise_tenon: 是否启用榫卯节点非线性弹簧
+            spring_properties: 榫卯弹簧参数
         """
         self.constitutive = TimberOrthotropicConstitutive(timber_properties)
         self.nodes: List[np.ndarray] = []
         self.elements: List[TimberBeamElement] = []
+        self.springs: List[NonlinearRotationalSpring] = []
         self.node_dof_map: Dict[int, np.ndarray] = {}
         self.n_dofs: int = 0
         self.boundary_conditions: Dict[int, np.ndarray] = {}
@@ -35,14 +194,96 @@ class PagodaFEAModel:
         self.n_floors = 5
         self.columns_per_floor = 24
         self.beams_per_floor = 48
+        self.use_mortise_tenon = use_mortise_tenon
+        self.spring_properties = spring_properties or NonlinearSpringProperties(
+            k_initial=5e7,
+            k_softening=5e6,
+            yield_force=5e4,
+            hardening_factor=0.1,
+            gap=0.0005,
+            damping_ratio=0.03
+        )
+        self.mortise_tenon_locations: List[Dict] = []
 
     def build_model(self):
         """构建木塔有限元模型"""
         self._create_nodes()
         self._create_column_elements()
         self._create_beam_elements()
+        if self.use_mortise_tenon:
+            self._create_mortise_tenon_springs()
         self._assemble_global_matrices()
         self._apply_boundary_conditions()
+
+    def _create_mortise_tenon_springs(self):
+        """
+        创建榫卯节点非线性弹簧
+        在梁-柱节点处添加X、Y、Z三个方向的转动弹簧
+        每个梁柱节点连接点放置3个弹簧
+        """
+        spring_props = self.spring_properties
+        floor_spring_props = [
+            NonlinearSpringProperties(
+                k_initial=spring_props.k_initial * (0.8 + i * 0.05),
+                k_softening=spring_props.k_softening * (0.8 + i * 0.05),
+                yield_force=spring_props.yield_force * (0.7 + i * 0.075),
+                hardening_factor=spring_props.hardening_factor,
+                gap=spring_props.gap * (1 + i * 0.2),
+                damping_ratio=spring_props.damping_ratio
+            )
+            for i in range(self.n_floors)
+        ]
+
+        for floor_idx in range(self.n_floors):
+            floor_props = floor_spring_props[floor_idx]
+            for col_idx in range(self.columns_per_floor):
+                node_lower = floor_idx * self.columns_per_floor + col_idx
+                node_upper = (floor_idx + 1) * self.columns_per_floor + col_idx
+
+                for axis in ['x', 'y', 'z']:
+                    spring = NonlinearRotationalSpring(
+                        node_lower,
+                        node_upper,
+                        floor_props,
+                        axis
+                    )
+                    self.springs.append(spring)
+                    self.mortise_tenon_locations.append({
+                        'floor': floor_idx + 1,
+                        'column': col_idx,
+                        'axis': axis,
+                        'node_lower': node_lower,
+                        'node_upper': node_upper,
+                        'spring_id': len(self.springs) - 1
+                    })
+
+    def _assemble_spring_stiffness(self, K: lil_matrix,
+                                   deformations: Optional[np.ndarray] = None) -> None:
+        """
+        组装弹簧单元刚度矩阵
+
+        Args:
+            K: 整体刚度矩阵
+            deformations: 当前各节点变形向量，用于计算非线性刚度
+        """
+        for spring in self.springs:
+            deformation = 0.0
+            if deformations is not None:
+                dofs_i = self.node_dof_map[spring.node_i]
+                dofs_j = self.node_dof_map[spring.node_j]
+                rot_idx = {'x': 3, 'y': 4, 'z': 5}[spring.axis]
+                deformation = deformations[dofs_j[rot_idx]] - deformations[dofs_i[rot_idx]]
+
+            k_e = spring.get_element_stiffness_matrix(deformation)
+
+            nodes = [spring.node_i, spring.node_j]
+            dofs = []
+            for node in nodes:
+                dofs.extend(self.node_dof_map[node].tolist())
+
+            for i, di in enumerate(dofs):
+                for j, dj in enumerate(dofs):
+                    K[di, dj] += k_e[i, j]
 
     def _create_nodes(self):
         """创建节点 - 每层创建24个柱节点"""
@@ -145,8 +386,85 @@ class PagodaFEAModel:
                     K[di, dj] += k_e[i, j]
                     M[di, dj] += m_e[i, j]
 
+        if self.use_mortise_tenon:
+            self._assemble_spring_stiffness(K)
+
         self.K = K.tocsr()
         self.M = M.tocsr()
+
+    def _update_tangent_stiffness(self, u: np.ndarray) -> csr_matrix:
+        """
+        更新切线刚度矩阵（考虑榫卯弹簧的非线性）
+
+        Args:
+            u: 当前位移向量
+
+        Returns:
+            K_t: 更新后的切线刚度矩阵
+        """
+        if not self.use_mortise_tenon:
+            return self.K
+
+        K = lil_matrix((self.n_dofs, self.n_dofs))
+
+        for element in self.elements:
+            k_e = element.get_global_stiffness()
+            nodes = [self.nodes.index(element.node_i), self.nodes.index(element.node_j)]
+            dofs = []
+            for node in nodes:
+                dofs.extend(self.node_dof_map[node].tolist())
+
+            for i, di in enumerate(dofs):
+                for j, dj in enumerate(dofs):
+                    K[di, dj] += k_e[i, j]
+
+        self._assemble_spring_stiffness(K, u)
+
+        return K.tocsr()
+
+    def _compute_spring_internal_forces(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+        """
+        计算弹簧的内力向量
+
+        Args:
+            u: 位移向量
+            v: 速度向量
+
+        Returns:
+            F_int: 内力向量
+        """
+        F_int = np.zeros(self.n_dofs)
+
+        for spring in self.springs:
+            dofs_i = self.node_dof_map[spring.node_i]
+            dofs_j = self.node_dof_map[spring.node_j]
+            rot_idx = {'x': 3, 'y': 4, 'z': 5}[spring.axis]
+
+            deformation = u[dofs_j[rot_idx]] - u[dofs_i[rot_idx]]
+            velocity = v[dofs_j[rot_idx]] - v[dofs_i[rot_idx]]
+
+            force, _ = spring.compute_force(deformation, velocity)
+
+            F_int[dofs_i[rot_idx]] += force
+            F_int[dofs_j[rot_idx]] -= force
+
+        return F_int
+
+    def get_mortise_tenon_damage(self) -> List[Dict]:
+        """获取榫卯节点的损伤状态"""
+        damage_list = []
+        for loc, spring in zip(self.mortise_tenon_locations, self.springs):
+            if spring.damage_index > 0.01:
+                damage_list.append({
+                    'floor': loc['floor'],
+                    'column': loc['column'],
+                    'axis': loc['axis'],
+                    'damage_index': spring.damage_index,
+                    'yielded': spring.yielded,
+                    'history_deformation': spring.history_deformation,
+                    'history_force': spring.history_force
+                })
+        return damage_list
 
     def _apply_boundary_conditions(self):
         """施加边界条件 - 底部固定"""
@@ -225,9 +543,11 @@ class PagodaFEAModel:
                              u0: Optional[np.ndarray] = None,
                              v0: Optional[np.ndarray] = None,
                              gamma: float = 0.5,
-                             beta: float = 0.25) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                             beta: float = 0.25,
+                             max_iterations: int = 20,
+                             tolerance: float = 1e-6) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Newmark-beta法求解动力时程
+        Newmark-beta法求解动力时程（考虑非线性，牛顿-拉夫逊迭代）
 
         Args:
             F: 荷载矩阵 [n_dofs, n_timesteps]
@@ -235,6 +555,8 @@ class PagodaFEAModel:
             u0: 初始位移
             v0: 初始速度
             gamma, beta: Newmark参数
+            max_iterations: 最大迭代次数
+            tolerance: 收敛容差
 
         Returns:
             u: 位移时程
@@ -254,6 +576,9 @@ class PagodaFEAModel:
 
         u[:, 0] = u0
         v[:, 0] = v0
+
+        for spring in self.springs:
+            spring.reset()
 
         K_ff = self.K[self.free_dofs, :][:, self.free_dofs]
         M_ff = self.M[self.free_dofs, :][:, self.free_dofs]
@@ -276,9 +601,59 @@ class PagodaFEAModel:
             u_pred = u_ff[:, step] + dt * v_ff[:, step] + (dt ** 2 / 2) * (1 - 2 * beta) * a_ff[:, step]
             v_pred = v_ff[:, step] + dt * (1 - gamma) * a_ff[:, step]
 
-            F_hat = F_ff[:, step + 1] - C_ff @ v_pred - K_ff @ u_pred
+            u_full = np.zeros(self.n_dofs)
+            u_full[self.free_dofs] = u_pred
+            v_full = np.zeros(self.n_dofs)
+            v_full[self.free_dofs] = v_pred
+
+            if self.use_mortise_tenon:
+                F_int_full = self._compute_spring_internal_forces(u_full, v_full)
+                F_int_ff = F_int_full[self.free_dofs]
+            else:
+                F_int_ff = np.zeros_like(u_pred)
+
+            F_hat = F_ff[:, step + 1] - C_ff @ v_pred - K_ff @ u_pred - F_int_ff
 
             delta_u = spsolve(K_hat, F_hat)
+
+            if self.use_mortise_tenon:
+                u_iter = u_pred.copy()
+                v_iter = v_pred.copy()
+                a_iter = a_ff[:, step].copy()
+
+                for iteration in range(max_iterations):
+                    u_full_iter = np.zeros(self.n_dofs)
+                    u_full_iter[self.free_dofs] = u_iter + delta_u
+                    v_full_iter = np.zeros(self.n_dofs)
+                    v_full_iter[self.free_dofs] = v_iter + gamma / (beta * dt) * delta_u
+
+                    K_t_full = self._update_tangent_stiffness(u_full_iter)
+                    K_t_ff = K_t_full[self.free_dofs, :][:, self.free_dofs]
+
+                    F_int_full_iter = self._compute_spring_internal_forces(
+                        u_full_iter, v_full_iter
+                    )
+                    F_int_ff_iter = F_int_full_iter[self.free_dofs]
+
+                    v_new = v_pred + gamma / (beta * dt) * delta_u
+                    a_new = (delta_u - dt * v_pred - dt ** 2 / 2 * (1 - 2 * beta) * a_iter) / (beta * dt ** 2)
+
+                    residual = F_ff[:, step + 1] - \
+                               M_ff @ a_new - \
+                               C_ff @ v_new - \
+                               K_t_ff @ (u_iter + delta_u) - \
+                               F_int_ff_iter
+
+                    residual_norm = np.linalg.norm(residual)
+                    if residual_norm < tolerance:
+                        break
+
+                    K_hat_iter = K_t_ff + gamma / (beta * dt) * C_ff + 1 / (beta * dt ** 2) * M_ff
+                    delta_u_correction = spsolve(K_hat_iter, residual)
+                    delta_u += delta_u_correction
+
+                    if np.linalg.norm(delta_u_correction) < tolerance * np.linalg.norm(delta_u):
+                        break
 
             delta_v = gamma / (beta * dt) * delta_u - gamma / beta * v_ff[:, step] + dt * (1 - gamma / (2 * beta)) * a_ff[:, step]
             delta_a = 1 / (beta * dt ** 2) * delta_u - 1 / (beta * dt) * v_ff[:, step] - 1 / (2 * beta) * a_ff[:, step]
@@ -407,6 +782,8 @@ class PagodaFEAModel:
         floor_accelerations = self._extract_floor_accelerations(a)
         element_stresses = self._compute_element_stresses(u)
 
+        mortise_tenon_damage = self.get_mortise_tenon_damage() if self.use_mortise_tenon else []
+
         results = {
             'time': t,
             'displacement': u,
@@ -416,7 +793,10 @@ class PagodaFEAModel:
             'floor_accelerations': floor_accelerations,
             'element_stresses': element_stresses,
             'natural_frequencies': self.natural_frequencies,
-            'mode_shapes': self.mode_shapes.tolist() if self.mode_shapes is not None else None
+            'mode_shapes': self.mode_shapes.tolist() if self.mode_shapes is not None else None,
+            'mortise_tenon_damage': mortise_tenon_damage,
+            'use_mortise_tenon': self.use_mortise_tenon,
+            'spring_count': len(self.springs)
         }
 
         return results
